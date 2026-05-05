@@ -1,0 +1,304 @@
+import os
+import re
+from pathlib import Path
+from typing import Any
+
+from utils.preprocessor import preprocess_text
+
+
+class ModelServiceError(RuntimeError):
+    pass
+
+
+class ModelService:
+    """Singleton responsable de cargar modelos y ejecutar inferencia."""
+
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __init__(self) -> None:
+        if getattr(self, "_initialized", False):
+            return
+
+        self._initialized = True
+        self.base_dir = Path(__file__).resolve().parents[1]
+        self.sentiment_model_path = self._resolve_path(
+            os.getenv("SENTIMENT_MODEL_PATH", "models/sentiment_model")
+        )
+        self.bot_model_path = self._resolve_path(os.getenv("BOT_MODEL_PATH", "models/bot_model"))
+        self.sentiment_labels = self._parse_labels(
+            os.getenv("SENTIMENT_LABELS"),
+            ["Bueno", "Regular", "Malo"],
+        )
+        self.bot_labels = self._parse_labels(os.getenv("BOT_LABELS"), ["No bot", "Bot"])
+        self.model_max_tokens = int(os.getenv("MODEL_MAX_TOKENS", "192"))
+        self.allow_degraded_mode = self._parse_bool(os.getenv("ALLOW_DEGRADED_MODE", "true"))
+
+        self.device = "cpu"
+        self.torch = None
+        self.sentiment_tokenizer = None
+        self.sentiment_model = None
+        self.bot_tokenizer = None
+        self.bot_model = None
+        self.loaded = False
+        self.degraded = False
+        self.load_error = ""
+
+    def _resolve_path(self, value: str) -> Path:
+        path = Path(value)
+        return path if path.is_absolute() else self.base_dir / path
+
+    @staticmethod
+    def _parse_bool(value: str | None) -> bool:
+        if value is None:
+            return False
+        return value.strip().lower() in {"1", "true", "yes", "si", "on"}
+
+    @staticmethod
+    def _parse_labels(value: str | None, default: list[str]) -> list[str]:
+        if not value:
+            return default
+        labels = [item.strip() for item in value.split(",") if item.strip()]
+        return labels or default
+
+    @staticmethod
+    def _has_model_files(path: Path) -> bool:
+        weight_files = {"pytorch_model.bin", "model.safetensors", "tf_model.h5"}
+        return path.exists() and (path / "config.json").exists() and any(
+            (path / file_name).exists() for file_name in weight_files
+        )
+
+    def load_models(self) -> None:
+        """Carga ambos modelos. Si falla y esta permitido, activa modo degradado."""
+        if self.loaded or self.degraded:
+            return
+
+        try:
+            if not self._has_model_files(self.sentiment_model_path):
+                raise ModelServiceError(
+                    f"No se encontro el modelo de sentimiento en {self.sentiment_model_path}."
+                )
+            if not self._has_model_files(self.bot_model_path):
+                raise ModelServiceError(f"No se encontro el modelo de bot en {self.bot_model_path}.")
+
+            import torch
+            from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+            self.torch = torch
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+
+            self.sentiment_tokenizer = AutoTokenizer.from_pretrained(
+                self.sentiment_model_path,
+                local_files_only=True,
+            )
+            self.sentiment_model = AutoModelForSequenceClassification.from_pretrained(
+                self.sentiment_model_path,
+                local_files_only=True,
+            ).to(self.device)
+            self.sentiment_model.eval()
+            self.sentiment_labels = self._labels_from_config(
+                self.sentiment_model,
+                self.sentiment_labels,
+                "sentimiento",
+            )
+
+            self.bot_tokenizer = AutoTokenizer.from_pretrained(
+                self.bot_model_path,
+                local_files_only=True,
+            )
+            self.bot_model = AutoModelForSequenceClassification.from_pretrained(
+                self.bot_model_path,
+                local_files_only=True,
+            ).to(self.device)
+            self.bot_model.eval()
+            self.bot_labels = self._labels_from_config(self.bot_model, self.bot_labels, "bot")
+
+            self.loaded = True
+            self.degraded = False
+            self.load_error = ""
+        except Exception as exc:
+            self.loaded = False
+            self.load_error = str(exc)
+
+            if not self.allow_degraded_mode:
+                raise ModelServiceError(f"No se pudieron cargar los modelos: {exc}") from exc
+
+            self.degraded = True
+
+    def _labels_from_config(self, model: Any, fallback: list[str], task: str) -> list[str]:
+        id2label = getattr(model.config, "id2label", {}) or {}
+        num_labels = int(getattr(model.config, "num_labels", len(fallback)))
+        labels = []
+
+        for index in range(num_labels):
+            configured = id2label.get(index) or id2label.get(str(index))
+            label = configured or (fallback[index] if index < len(fallback) else f"Clase {index}")
+            if str(label).upper() == f"LABEL_{index}":
+                label = fallback[index] if index < len(fallback) else label
+            labels.append(self._normalize_label(str(label), task))
+
+        return labels
+
+    @staticmethod
+    def _normalize_label(label: str, task: str) -> str:
+        normalized = label.strip().lower().replace("_", " ").replace("-", " ")
+
+        if task == "sentimiento":
+            mapping = {
+                "good": "Bueno",
+                "positive": "Bueno",
+                "positivo": "Bueno",
+                "neutral": "Regular",
+                "neutro": "Regular",
+                "bad": "Malo",
+                "negative": "Malo",
+                "negativo": "Malo",
+            }
+        else:
+            mapping = {
+                "human": "No bot",
+                "not bot": "No bot",
+                "no bot": "No bot",
+                "bot": "Bot",
+                "generated": "Bot",
+            }
+
+        return mapping.get(normalized, label.strip())
+
+    def analyze(self, comment: str) -> dict:
+        text = preprocess_text(comment)
+        if not text:
+            raise ValueError("El comentario no puede estar vacio.")
+
+        if self.loaded:
+            sentiment = self._predict_with_model(
+                text,
+                self.sentiment_tokenizer,
+                self.sentiment_model,
+                self.sentiment_labels,
+            )
+            bot = self._predict_with_model(text, self.bot_tokenizer, self.bot_model, self.bot_labels)
+        elif self.degraded:
+            sentiment = self._predict_sentiment_degraded(text)
+            bot = self._predict_bot_degraded(text)
+        else:
+            raise ModelServiceError("Los modelos no estan cargados.")
+
+        return {
+            "comentario": comment.strip(),
+            "sentimiento": sentiment,
+            "bot": bot,
+        }
+
+    def _predict_with_model(self, text: str, tokenizer: Any, model: Any, labels: list[str]) -> dict:
+        inputs = tokenizer(
+            text,
+            return_tensors="pt",
+            truncation=True,
+            padding=True,
+            max_length=self.model_max_tokens,
+        )
+        inputs = {key: value.to(self.device) for key, value in inputs.items()}
+
+        with self.torch.no_grad():
+            outputs = model(**inputs)
+            probabilities_tensor = self.torch.softmax(outputs.logits, dim=-1)[0]
+
+        probabilities = probabilities_tensor.detach().cpu().tolist()
+        best_index = int(max(range(len(probabilities)), key=probabilities.__getitem__))
+        probability_map = {
+            labels[index]: round(float(probability), 4)
+            for index, probability in enumerate(probabilities)
+            if index < len(labels)
+        }
+
+        return {
+            "clase": labels[best_index],
+            "confianza": round(float(probabilities[best_index]), 4),
+            "probabilidades": probability_map,
+        }
+
+    def _predict_sentiment_degraded(self, text: str) -> dict:
+        positive_words = {
+            "excelente",
+            "bueno",
+            "buen",
+            "genial",
+            "rapido",
+            "recomendado",
+            "gracias",
+            "perfecto",
+            "feliz",
+        }
+        negative_words = {
+            "malo",
+            "pesimo",
+            "horrible",
+            "lento",
+            "problema",
+            "queja",
+            "demora",
+            "fallo",
+            "estafa",
+        }
+        tokens = set(re.findall(r"\w+", text.lower()))
+        positives = len(tokens & positive_words)
+        negatives = len(tokens & negative_words)
+
+        if positives > negatives:
+            probabilities = {"Bueno": 0.78, "Regular": 0.15, "Malo": 0.07}
+        elif negatives > positives:
+            probabilities = {"Bueno": 0.08, "Regular": 0.17, "Malo": 0.75}
+        else:
+            probabilities = {"Bueno": 0.22, "Regular": 0.61, "Malo": 0.17}
+
+        return self._prediction_from_probs(probabilities)
+
+    def _predict_bot_degraded(self, text: str) -> dict:
+        lowered = text.lower()
+        words = re.findall(r"\w+", lowered)
+        unique_ratio = len(set(words)) / max(len(words), 1)
+        suspicious_score = 0
+        suspicious_score += lowered.count("http://") + lowered.count("https://") + lowered.count("www.")
+        suspicious_score += 1 if lowered.count("#") >= 3 else 0
+        suspicious_score += 1 if lowered.count("@") >= 3 else 0
+        suspicious_score += 1 if re.search(r"([!?])\1{2,}", text) else 0
+        suspicious_score += sum(
+            term in lowered for term in ("promo", "gratis", "click", "gana", "oferta", "link")
+        )
+        suspicious_score += 1 if len(words) > 35 and unique_ratio < 0.55 else 0
+
+        probabilities = (
+            {"No bot": 0.25, "Bot": 0.75}
+            if suspicious_score >= 3
+            else {"No bot": 0.82, "Bot": 0.18}
+        )
+        return self._prediction_from_probs(probabilities)
+
+    @staticmethod
+    def _prediction_from_probs(probabilities: dict[str, float]) -> dict:
+        label = max(probabilities, key=probabilities.get)
+        return {
+            "clase": label,
+            "confianza": round(float(probabilities[label]), 4),
+            "probabilidades": {key: round(float(value), 4) for key, value in probabilities.items()},
+        }
+
+    def health(self) -> dict:
+        return {
+            "status": "ok" if self.loaded or self.degraded else "error",
+            "modelos_cargados": self.loaded,
+            "modo_degradado": self.degraded,
+            "dispositivo": self.device,
+            "sentiment_model_path": str(self.sentiment_model_path),
+            "bot_model_path": str(self.bot_model_path),
+            "error": self.load_error or None,
+        }
+
+
+model_service = ModelService()
+
