@@ -35,6 +35,7 @@ class ModelService:
             ["Bueno", "Regular", "Malo"],
         )
         self.bot_labels = self._parse_labels(os.getenv("BOT_LABELS"), ["No bot", "Bot"])
+        self.max_text_length = int(os.getenv("MAX_TEXT_LENGTH", "512"))
         self.model_max_tokens = int(os.getenv("MODEL_MAX_TOKENS", "192"))
         self.allow_degraded_mode = self._parse_bool(os.getenv("ALLOW_DEGRADED_MODE", "true"))
 
@@ -170,7 +171,7 @@ class ModelService:
         return mapping.get(normalized, label.strip())
 
     def analyze(self, comment: str) -> dict:
-        text = preprocess_text(comment)
+        text = preprocess_text(comment, max_length=self.max_text_length)
         if not text:
             raise ValueError("El comentario no puede estar vacio.")
 
@@ -301,4 +302,3 @@ class ModelService:
 
 
 model_service = ModelService()
-
