@@ -1,5 +1,6 @@
 import os
 import re
+import json
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +49,8 @@ class ModelService:
         self.loaded = False
         self.degraded = False
         self.load_error = ""
+        self.sentiment_active_path = self.sentiment_model_path
+        self.bot_active_path = self.bot_model_path
 
     def _resolve_path(self, value: str) -> Path:
         path = Path(value)
@@ -73,17 +76,80 @@ class ModelService:
             (path / file_name).exists() for file_name in weight_files
         )
 
+    @staticmethod
+    def _checkpoint_number(path: Path) -> int:
+        match = re.search(r"checkpoint-(\d+)$", path.name)
+        return int(match.group(1)) if match else -1
+
+    def _resolve_model_dir(self, base_path: Path) -> Path:
+        """
+        Devuelve el directorio del modelo listo para cargar:
+        1) Si el path ya tiene artefactos HF, se usa tal cual.
+        2) Si no, intenta usar el checkpoint-* mas alto dentro del path.
+        """
+        if self._has_model_files(base_path):
+            return base_path
+
+        checkpoint_dirs = [
+            item
+            for item in base_path.glob("checkpoint-*")
+            if item.is_dir() and self._has_model_files(item)
+        ]
+        if checkpoint_dirs:
+            checkpoint_dirs.sort(key=self._checkpoint_number, reverse=True)
+            return checkpoint_dirs[0]
+
+        return base_path
+
+    @staticmethod
+    def _load_label_mappings(path: Path, fallback: list[str], task: str) -> list[str]:
+        """
+        Carga mapeos de etiquetas personalizados desde label_mappings.json cuando existe.
+        Soporta formato:
+        - {"0":"Bueno","1":"Regular","2":"Malo"}
+        - {"id2label":{"0":"Bueno","1":"Regular","2":"Malo"}}
+        """
+        mapping_file = path / "label_mappings.json"
+        if not mapping_file.exists():
+            return fallback
+
+        try:
+            payload = json.loads(mapping_file.read_text(encoding="utf-8"))
+        except Exception:
+            return fallback
+
+        id2label = payload.get("id2label", payload) if isinstance(payload, dict) else {}
+        if not isinstance(id2label, dict):
+            return fallback
+
+        pairs = []
+        for key, value in id2label.items():
+            try:
+                pairs.append((int(key), str(value)))
+            except Exception:
+                continue
+
+        if not pairs:
+            return fallback
+
+        pairs.sort(key=lambda item: item[0])
+        labels = [ModelService._normalize_label(label, task) for _, label in pairs]
+        return labels or fallback
+
     def load_models(self) -> None:
         """Carga ambos modelos. Si falla y esta permitido, activa modo degradado."""
         if self.loaded or self.degraded:
             return
 
         try:
-            if not self._has_model_files(self.sentiment_model_path):
+            self.sentiment_active_path = self._resolve_model_dir(self.sentiment_model_path)
+            self.bot_active_path = self._resolve_model_dir(self.bot_model_path)
+
+            if not self._has_model_files(self.sentiment_active_path):
                 raise ModelServiceError(
                     f"No se encontro el modelo de sentimiento en {self.sentiment_model_path}."
                 )
-            if not self._has_model_files(self.bot_model_path):
+            if not self._has_model_files(self.bot_active_path):
                 raise ModelServiceError(f"No se encontro el modelo de bot en {self.bot_model_path}.")
 
             import torch
@@ -93,11 +159,11 @@ class ModelService:
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
             self.sentiment_tokenizer = AutoTokenizer.from_pretrained(
-                self.sentiment_model_path,
+                self.sentiment_active_path,
                 local_files_only=True,
             )
             self.sentiment_model = AutoModelForSequenceClassification.from_pretrained(
-                self.sentiment_model_path,
+                self.sentiment_active_path,
                 local_files_only=True,
             ).to(self.device)
             self.sentiment_model.eval()
@@ -106,17 +172,27 @@ class ModelService:
                 self.sentiment_labels,
                 "sentimiento",
             )
+            self.sentiment_labels = self._load_label_mappings(
+                self.sentiment_active_path,
+                self.sentiment_labels,
+                "sentimiento",
+            )
 
             self.bot_tokenizer = AutoTokenizer.from_pretrained(
-                self.bot_model_path,
+                self.bot_active_path,
                 local_files_only=True,
             )
             self.bot_model = AutoModelForSequenceClassification.from_pretrained(
-                self.bot_model_path,
+                self.bot_active_path,
                 local_files_only=True,
             ).to(self.device)
             self.bot_model.eval()
             self.bot_labels = self._labels_from_config(self.bot_model, self.bot_labels, "bot")
+            self.bot_labels = self._load_label_mappings(
+                self.bot_active_path,
+                self.bot_labels,
+                "bot",
+            )
 
             self.loaded = True
             self.degraded = False
@@ -297,6 +373,8 @@ class ModelService:
             "dispositivo": self.device,
             "sentiment_model_path": str(self.sentiment_model_path),
             "bot_model_path": str(self.bot_model_path),
+            "sentiment_model_activo": str(self.sentiment_active_path),
+            "bot_model_activo": str(self.bot_active_path),
             "error": self.load_error or None,
         }
 

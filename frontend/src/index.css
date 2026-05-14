@@ -413,8 +413,10 @@ blockquote {
   font-size: 18px;
 }
 
-.chart-card canvas {
-  min-height: 230px;
+.chart-body {
+  position: relative;
+  width: 100%;
+  height: 240px;
 }
 
 .dropzone {
@@ -588,4 +590,3 @@ tr:last-child td {
     flex-direction: column;
   }
 }
-

@@ -79,27 +79,32 @@ npm run dev
 
 ## Modelos locales
 
-Cada modelo debe tener estructura Hugging Face:
+Cada modelo puede estar de dos formas:
+
+1. Archivos finales en la raiz del directorio del modelo.
+
+2. Carpetas `checkpoint-*` dentro del directorio.
+: En ese caso SentinelAI elige automaticamente el checkpoint mas alto.
+
+Archivos esperados:
 
 ```text
 backend/models/sentiment_model/
   config.json
   tokenizer.json
-  pytorch_model.bin
+  model.safetensors o pytorch_model.bin
   tokenizer_config.json
-  special_tokens_map.json
+  label_mappings.json (opcional, recomendado)
 
 backend/models/bot_model/
   config.json
   tokenizer.json
-  pytorch_model.bin
+  model.safetensors o pytorch_model.bin
   tokenizer_config.json
-  special_tokens_map.json
+  label_mappings.json (opcional, recomendado)
 ```
 
-Tambien se acepta `model.safetensors`.
-
-Si los modelos no estan disponibles, FastAPI arranca en modo degradado para que la plataforma pueda demostrarse. Para exigir modelos reales, cambia en `backend/.env`:
+Si los modelos no estan disponibles, FastAPI puede arrancar en modo degradado para demostracion. Para exigir modelos reales:
 
 ```bash
 ALLOW_DEGRADED_MODE=false
@@ -210,7 +215,7 @@ SENTIMENT_LABELS=Bueno,Regular,Malo
 BOT_LABELS=No bot,Bot
 MAX_TEXT_LENGTH=512
 MODEL_MAX_TOKENS=192
-ALLOW_DEGRADED_MODE=true
+ALLOW_DEGRADED_MODE=false
 ```
 
 Frontend:
@@ -237,4 +242,3 @@ cd frontend
 npm run lint
 npm run build
 ```
-

@@ -1,24 +1,43 @@
 # Modelos de SentinelAI
 
-Coloca aqui los modelos XLM-RoBERTa exportados con formato Hugging Face.
-
-## Estructura esperada
+Coloca los modelos entrenados en estas rutas:
 
 ```text
-models/
-  sentiment_model/
-    config.json
-    tokenizer.json
-    pytorch_model.bin
-    tokenizer_config.json
-    special_tokens_map.json
-  bot_model/
-    config.json
-    tokenizer.json
-    pytorch_model.bin
-    tokenizer_config.json
-    special_tokens_map.json
+backend/models/sentiment_model/
+backend/models/bot_model/
 ```
 
-El backend tambien reconoce `model.safetensors`.
+Cada carpeta puede tener los archivos finales en la raiz:
 
+```text
+config.json
+model.safetensors (o pytorch_model.bin)
+tokenizer.json
+tokenizer_config.json
+label_mappings.json (opcional, recomendado)
+```
+
+Tambien se soporta estructura con checkpoints:
+
+```text
+sentiment_model/
+  checkpoint-3750/
+  checkpoint-5625/
+bot_model/
+  checkpoint-1174/
+  checkpoint-1761/
+```
+
+Si hay varios `checkpoint-*`, el backend usa automaticamente el mas alto (ultimo).
+
+`label_mappings.json` puede tener:
+
+```json
+{
+  "id2label": {
+    "0": "Bueno",
+    "1": "Regular",
+    "2": "Malo"
+  }
+}
+```
